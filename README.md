@@ -97,3 +97,9 @@ Then open <http://localhost:8000> in your browser.
 | `manifest.webmanifest` | Lets the game be installed as an app |
 | `sw.js` | Lets the game work offline |
 | `icons/` | App icons |
+
+---
+
+## License
+
+Free to use, change, and share under the [MIT License](LICENSE).
