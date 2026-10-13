@@ -25,7 +25,9 @@ A space game where you captain a starship. You can:
 2. Type a name for your captain and click **Launch career**.
 3. A built-in tutorial called **Flight School** will walk you through everything.
 
-You can restart the tutorial anytime with the **? GUIDE** button at the top of the screen.
+You can restart the tutorial anytime with the **? GUIDE** button at the top of the screen (just **?** on phones).
+
+The game works on phones and tablets in both portrait and landscape. On a phone, the tabs move to the bottom of the screen (portrait) or the left edge (landscape), and every panel fits the screen width, so there is no sideways scrolling.
 
 ---
 
