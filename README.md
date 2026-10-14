@@ -54,7 +54,7 @@ Yes. Your game saves automatically in your browser.
 
 ## Playing with other people (optional)
 
-You do **not** need this to play. The game includes pretend players so the galaxy feels alive.
+You do **not** need this to play. The game includes ai players so the galaxy feels alive.
 
 To play with real people nearby, you need a **MeshCore companion radio** (a small LoRa radio device).
 
