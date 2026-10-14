@@ -1,5 +1,5 @@
 // MESH WARS service worker: caches the game so it starts with no internet connection.
-const CACHE = 'meshwars-v4';
+const CACHE = 'meshwars-v5';
 const SHELL = [
   './',
   './index.html',

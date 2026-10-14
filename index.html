@@ -155,6 +155,7 @@ label.f{display:flex;flex-direction:column;gap:3px;font-size:10px;letter-spacing
 .unit svg,.crewcard svg{display:block}
 ::-webkit-scrollbar{width:8px;height:8px}::-webkit-scrollbar-thumb{background:#1d3a5a}::-webkit-scrollbar-track{background:transparent}
 .market td.acts,.market .bp{white-space:nowrap}
+.hailgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(100%,250px),1fr));column-gap:8px}
 
 /* ---------- Mobile / small screens ---------- */
 /* compact header: icon-only logo, status chips that fit without sideways scrolling */
@@ -769,7 +770,15 @@ const AudioEngine = (() => {
 // tab loopback, outbound queue (IndexedDB) and room-server polling
 // ============================================================================
 const MeshProtocol = (() => {
-  const SIZE = { TRADE: 7, BOUNTY: 10, SIGNATURE: 16 };
+  const SIZE = { TRADE: 7, BOUNTY: 10, HAIL: 13, SIGNATURE: 16 };
+  // Canned hail catalogue. The index is the wire id, so only ever append new lines (never reorder or remove).
+  // {sys} expands to the sender's current star system.
+  const HAILS = [
+    'Greetings, Captain.', 'Fair winds and full holds.', 'Want to trade? Meet me at {sys}.', 'Pirates spotted near {sys} - fly careful.',
+    'Requesting escort out of {sys}.', 'Mayday! Under fire near {sys}!', 'Prices are hot at {sys} right now.', 'On my way.',
+    'Thanks, Captain!', 'Good fight. o7', 'Stand down - I mean no harm.', 'You are on my scope. Prepare to be boarded.',
+    'Copy that.', 'Negative.', 'Signing off - see you in the black.',
+  ];
   const PREFIX = 'MW';
   const SIG_VERSION = 1;
   const NUS = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
@@ -782,6 +791,7 @@ const MeshProtocol = (() => {
   const GAME_CHANNEL = '#meshwars';
   const GAME_KEY = hashtagKey(GAME_CHANNEL);
   const MAX_TEXT = 96;
+  const HAIL_TTL_MS = 30 * 60 * 1000;
 
   function crc16(bytes, n) {
     let a = 0xffff;
@@ -815,8 +825,20 @@ const MeshProtocol = (() => {
     v.setUint8(13, SIG_VERSION | (departing ? 0x80 : 0)); v.setUint16(14, crc16(u8, 14));
     return u8;
   }
+  // Captain Hail (13B): [FromHash:4 | ToHash:4 (0 = all captains) | MsgId:1 | Sector:1 (255 = unknown) | Nonce:1 | crc16:2]
+  // The nonce keeps a repeated identical hail from being discarded as a duplicate; room/channel copies still de-duplicate.
+  function packHail({ from, to, msg, sector, nonce = (Math.random() * 256) | 0 }) {
+    const u8 = new Uint8Array(SIZE.HAIL), v = new DataView(u8.buffer);
+    v.setUint32(0, from >>> 0); v.setUint32(4, to >>> 0); v.setUint8(8, msg & 255);
+    v.setUint8(9, sector >= 0 && sector < 255 ? sector : 255); v.setUint8(10, nonce & 255); v.setUint16(11, crc16(u8, 11));
+    return u8;
+  }
   function unpack(bytes) {
     const v = new DataView(bytes.buffer, bytes.byteOffset, bytes.length);
+    if (bytes.length === SIZE.HAIL) {
+      if (v.getUint16(11) !== crc16(bytes, 11)) return null;
+      return { kind: 'hail', from: v.getUint32(0), to: v.getUint32(4), msg: v.getUint8(8), sector: v.getUint8(9) };
+    }
     if (bytes.length === SIZE.TRADE) {
       const raw = v.getUint8(4);
       if (!raw) return null;
@@ -839,7 +861,7 @@ const MeshProtocol = (() => {
     return c * 60;
   }
   const encodeWire = bytes => PREFIX + U.b64e(bytes);
-  const WIRE_RE = /MW([A-Za-z0-9+/]{22}|[A-Za-z0-9+/]{14}|[A-Za-z0-9+/]{10})(?![A-Za-z0-9+/])/g;
+  const WIRE_RE = /MW([A-Za-z0-9+/]{22}|[A-Za-z0-9+/]{18}|[A-Za-z0-9+/]{14}|[A-Za-z0-9+/]{10})(?![A-Za-z0-9+/])/g;
   function decodeWire(text) {
     const out = []; let m;
     WIRE_RE.lastIndex = 0;
@@ -1174,7 +1196,12 @@ const MeshProtocol = (() => {
       if (ch == null) { this.log(`Outbox held: no ${GAME_CHANNEL} channel on the radio yet`); return; }
       this.flushing = true;
       try {
-        const items = (await StorageManager.all('outbox')).sort((a, b) => a.qid - b.qid);
+        const all = (await StorageManager.all('outbox')).sort((a, b) => a.qid - b.qid), items = [];
+        for (const it of all) {
+          // canned hails are conversational; don't deliver them long after they were written
+          if (it.kind === 'hail' && Date.now() - it.t > HAIL_TTL_MS) { await StorageManager.del('outbox', it.qid); this.log(`Dropped stale ${it.label}`); }
+          else items.push(it);
+        }
         while (items.length && this.client) {
           const batch = []; let len = 0;
           while (items.length && (!batch.length || len + items[0].wire.length + 1 <= MAX_TEXT)) { const it = items.shift(); batch.push(it); len += it.wire.length + 1; }
@@ -1204,7 +1231,7 @@ const MeshProtocol = (() => {
   };
 
   return {
-    SIZE, packTrade, packBounty, packSignature, unpack, encodeWire, decodeWire, encodeExpiry, decodeExpiry, crc16,
+    SIZE, HAILS, packTrade, packBounty, packSignature, packHail, unpack, encodeWire, decodeWire, encodeExpiry, decodeExpiry, crc16,
     GAME_CHANNEL, GAME_KEY, hashtagKey, SerialAdapter, BLEAdapter, MeshCoreClient, manager: M,
   };
 })();
@@ -1950,8 +1977,47 @@ const GameEngine = {
     this.log(`Posted ${U.fmt(reward)}cr bounty on ${this.ghostName(target)}`, 'mesh'); AudioEngine.play('radio'); this.changed();
     return true;
   },
-
-  // ---------- Mesh: inbound ----------
+  // ---------- Mesh: canned hails ----------
+  HAIL_COOLDOWN: 10,
+  hailText(msg, sector) {
+    const t = MeshProtocol.HAILS[msg];
+    if (t == null) return `[unknown hail #${msg} - update your game]`;
+    const sys = sector !== 255 && this.galaxy.systems[sector];
+    return t.replace('{sys}', sys ? sys.name : 'my position');
+  },
+  hailName(hash) { return hash ? this.ghostName(hash) : 'all captains'; },
+  sendHail(to, msg) {
+    const s = this.state, now = U.now();
+    if (MeshProtocol.HAILS[msg] == null) return false;
+    const wait = this.HAIL_COOLDOWN - (now - (this.lastHailAt || 0));
+    if (wait > 0) return this.fail(`Comms cooling down - wait ${wait}s (saves mesh airtime)`);
+    this.lastHailAt = now;
+    const pkt = { from: s.playerHash, to: to >>> 0, msg, sector: s.system };
+    const text = this.hailText(msg, s.system);
+    MeshProtocol.manager.queue(MeshProtocol.packHail(pkt), `Hail to ${this.hailName(pkt.to)}`, 'hail');
+    s.hails.unshift({ id: 'out' + Date.now(), dir: 'out', peer: pkt.to, msg, sector: s.system, t: now });
+    s.hails.length = Math.min(s.hails.length, 60);
+    this.log(`Hailed ${this.hailName(pkt.to)}: "${text}"`, 'mesh');
+    AudioEngine.play('radio');
+    ArtAndUIController.toast(MeshProtocol.manager.online() ? `Hail sent to ${this.hailName(pkt.to)}` : 'Hail queued - it goes out when your radio connects (within 30 min)', 'cy');
+    this.changed();
+    return true;
+  },
+  receiveHail(p, id, source, meta) {
+    const s = this.state, now = U.now();
+    if (p.from === s.playerHash || (p.to !== 0 && p.to !== s.playerHash)) return; // own echo, or addressed to someone else
+    let heard = now;
+    if (meta && meta.ts && meta.ts > now - 7 * 86400 && meta.ts < now + 300) heard = Math.min(meta.ts, now);
+    s.hails.unshift({ id, dir: 'in', peer: p.from, direct: p.to !== 0, msg: p.msg, sector: p.sector, t: heard, source });
+    s.hails.length = Math.min(s.hails.length, 60);
+    const g = s.ghosts[U.hex(p.from)];
+    if (g && !g.departed && heard > (g.lastHeard || 0)) g.lastHeard = heard; // a hail is proof of life
+    const text = this.hailText(p.msg, p.sector);
+    this.log(`${this.ghostName(p.from)}${p.to ? '' : ' (to all)'}: "${text}"`, 'mesh');
+    if (source !== 'sim') { this.unread++; AudioEngine.play('radio'); }
+    ArtAndUIController.toast(`${this.ghostName(p.from)}: "${text}"`, 'vio');
+    this.changed();
+  },
   applyPacket(p, bytes, source, meta = {}) {
     const s = this.state, id = U.hexBytes(bytes, '');
     if (p.kind === 'signature') {
@@ -1960,6 +2026,7 @@ const GameEngine = {
     }
     if (this.seen.has(id)) { if (p.kind === 'signature') this.changed(); return; }
     this.seen.add(id);
+    if (p.kind === 'hail') return this.receiveHail(p, id, source, meta);
     let text = '';
     if (p.kind === 'trade') {
       const sys = this.galaxy.systems[p.sector], c = COMMODITIES[p.commodity];
@@ -2038,7 +2105,7 @@ const GameEngine = {
       credits: 20000, timeOffset: 0, system: home, planet: 0,
       ship: { name: 'ISV Wayfarer', hullType: 1, hull: HULLS[1].hull, fuel: HULLS[1].fuel, modules: { w: ['laser', 'rail'], u: ['cargo', null] }, cargo: {} },
       crew: [], rep: [10, 0, 0, 0, 0], impacts: {}, purchases: {}, visited: { [home]: U.now() }, kills: 0, aggro: 40, jumps: 0,
-      log: [], disturbances: [], bounties: [], ghosts: {}, lastSigAt: 0, simBucket: -1, hiredIds: [], route: [],
+      log: [], disturbances: [], bounties: [], ghosts: {}, hails: [], lastSigAt: 0, simBucket: -1, hiredIds: [], route: [],
       settings: { channelAuto: true, channel: 0, roomPassword: '', roomFilter: '', simPeers: true, heartbeat: 15 },
     };
     this.state = st;
@@ -2055,6 +2122,7 @@ const GameEngine = {
       saved.crew = crew.sort((a, b) => a.order - b.order).map(c => { delete c.order; return c; });
       if (saved.settings.channelAuto === undefined) saved.settings.channelAuto = true;
       if (saved.settings.heartbeat === undefined) saved.settings.heartbeat = 15;
+      if (!Array.isArray(saved.hails)) saved.hails = [];
       this.state = saved;
       this.galaxy = this.generateGalaxy(saved.seed);
     } else {
@@ -2066,6 +2134,7 @@ const GameEngine = {
     bs.sort((a, b) => b.t - a.t);
     this.bulletins = bs.slice(0, 200);
     this.seen = new Set(bs.map(b => b.id));
+    this.state.hails.forEach(h => { if (h.dir === 'in') this.seen.add(h.id); }); // don't re-show hails replayed by a room server
     if (bs.length > 300) bs.slice(300).forEach(b => StorageManager.del('bulletins', b.id));
     this.prune();
   },
@@ -3500,10 +3569,10 @@ const ArtAndUIController = (() => {
     const dot = st => `<span class="led ${st === 'online' ? 'on' : st === 'recent' ? 'q' : ''}"></span>`;
     const via = g => ({ room: 'room server', tab: 'local tab', dm: 'direct msg' }[g.source] || (String(g.source).startsWith('ch') ? 'radio ' + g.source : g.source));
     const row = x => {
-      const g = x.g, ht = g.hull % HULLS.length;
+      const g = x.g, ht = g.hull % HULLS.length, canHail = x.status !== 'offline';
       return `<div class="spread" style="padding:5px 0;border-bottom:1px solid rgba(29,58,90,.5);font-size:12px">
         <span class="row" style="gap:8px">${dot(x.status)}<b class="vio">${esc(GameEngine.ghostName(g.player))}</b><span class="dim">${HULLS[ht].name} · R${g.rating}</span></span>
-        <span class="dim" style="text-align:right">${g.departed ? '<span class="red">signed off</span> ' : ''}${U.ago(x.age)}<br>${esc(via(g))}${g.hops != null ? ` · ${g.hops} hop${g.hops === 1 ? '' : 's'}` : ''}${g.snr != null ? ` · SNR ${g.snr}` : ''}</span></div>`;
+        <span class="row" style="gap:8px;flex-wrap:nowrap"><span class="dim" style="text-align:right">${g.departed ? '<span class="red">signed off</span> ' : ''}${U.ago(x.age)}<br>${esc(via(g))}${g.hops != null ? ` · ${g.hops} hop${g.hops === 1 ? '' : 's'}` : ''}${g.snr != null ? ` · SNR ${g.snr}` : ''}</span>${canHail ? `<button class="btn sm" data-act="hailAsk" data-to="${g.player}" title="Send a canned message">✉ Hail</button>` : ''}</span></div>`;
     };
     const section = (title, arr) => (arr.length ? `<h3 style="margin-top:10px">${title} (${arr.length})</h3>${arr.map(row).join('')}` : '');
     const sims = GameEngine.presenceList(true).filter(x => GameEngine.isSim(x.g)).length;
@@ -3512,10 +3581,32 @@ const ArtAndUIController = (() => {
       ? `You are on the mesh · ${hb ? `heartbeat every ${hb} min` : 'heartbeat off'}${S.lastSigAt ? ` · last sent ${U.ago(U.now() - S.lastSigAt)}` : ''}`
       : 'You are off the mesh - connect a radio to appear to others';
     return `<div class="bevel panel"><h2>Captains on the Mesh</h2>
-      <div class="row" style="gap:18px"><span><b class="grn" style="font-size:22px">${on.length}</b> <span class="dim">online</span></span><span><b class="gold" style="font-size:22px">${rec.length}</b> <span class="dim">recent</span></span><span class="sub">${dot(M.online() ? 'online' : 'offline')} ${you}</span></div>
+      <div class="row" style="gap:18px"><span><b class="grn" style="font-size:22px">${on.length}</b> <span class="dim">online</span></span><span><b class="gold" style="font-size:22px">${rec.length}</b> <span class="dim">recent</span></span><span class="sub">${dot(M.online() ? 'online' : 'offline')} ${you}</span><button class="btn sm gold" data-act="hailAsk" data-to="0" style="margin-left:auto">✉ Hail all</button></div>
       ${list.length ? section('Online', on) + section('Recently heard', rec) + section('Offline', off) : '<div class="sub" style="margin-top:8px">No real captains heard yet. Presence comes from ship-signature heartbeats on the game channel.</div>'}
       ${sims ? `<div class="sub" style="margin-top:10px"><span class="tag vio">SIM</span>${sims} simulated peer(s) active - not counted as online.</div>` : ''}
       <div class="sub" style="margin-top:8px">Online = heard within ${GameEngine.PRESENCE_ONLINE / 60} min (tolerates one lost heartbeat), recent = within ${GameEngine.PRESENCE_RECENT / 3600} h. Times use the sender's timestamp, so room-server catch-up is dated correctly.</div></div>`;
+  }
+  // quick replies offered under incoming hails (wire ids from MeshProtocol.HAILS)
+  const QUICK_REPLIES = [12, 8, 7, 13];
+  function commsPanel() {
+    const S = GameEngine.state, now = U.now();
+    const rows = S.hails.slice(0, 25).map((h, i) => {
+      const text = esc(GameEngine.hailText(h.msg, h.sector)), name = esc(GameEngine.hailName(h.peer));
+      const head = h.dir === 'in'
+        ? `<b class="vio">${name}</b> <span class="dim">→ ${h.direct ? 'you' : 'all'}</span>`
+        : `<b class="cy">You</b> <span class="dim">→ ${name}</span>`;
+      const replies = h.dir === 'in' && i < 5 && now - h.t < 3600
+        ? `<div class="row" style="gap:4px;margin-top:5px">${QUICK_REPLIES.map(m => `<button class="btn sm" data-act="sendHail" data-to="${h.peer}" data-m="${m}">${esc(MeshProtocol.HAILS[m])}</button>`).join('')}<button class="btn sm gold" data-act="hailAsk" data-to="${h.peer}">More…</button></div>` : '';
+      return `<div class="bul ${h.dir === 'in' ? 'signature' : 'trade'}"><div class="spread"><span>${head}</span><span class="dim">${U.ago(Math.max(0, now - h.t))}</span></div>“${text}”${replies}</div>`;
+    }).join('') || '<div class="sub">No hails yet. Use <b>✉ Hail</b> next to a captain, or <b>Hail all</b>, to send a canned message over the mesh.</div>';
+    return `<div class="bevel panel"><h2>Comms // Hails</h2><div style="max-height:340px;overflow:auto">${rows}</div></div>`;
+  }
+  function hailPicker(to) {
+    const S = GameEngine.state, name = esc(GameEngine.hailName(to)), M = MeshProtocol.manager;
+    const btns = MeshProtocol.HAILS.map((_, m) => `<button class="btn wide" data-act="sendHail" data-to="${to}" data-m="${m}">${esc(GameEngine.hailText(m, S.system))}</button>`).join('');
+    showModal(`<div class="spread"><h2 class="cy" style="letter-spacing:.18em;margin:0">HAIL ${name.toUpperCase()}</h2><button class="iconbtn off" data-act="closeModal" aria-label="Close">✕</button></div>
+      <div class="sub" style="margin:6px 0 10px">${to ? 'Only this captain will see it' : 'Every captain on the game channel will see it'}. Canned messages travel as a tiny 13-byte packet to save mesh airtime.${M.online() ? '' : ' <span class="gold">You are off-grid: the hail is queued and dropped if not sent within 30 minutes.</span>'}</div>
+      <div class="hailgrid">${btns}</div>`, false);
   }
   function viewMesh() {
     const S = GameEngine.state, M = MeshProtocol.manager, room = M.roomInfo(), pl = GameEngine.herePlanet();
@@ -3551,7 +3642,7 @@ const ArtAndUIController = (() => {
         <div class="row" style="margin-top:8px"><button class="btn gold" data-act="broadcastSig">Broadcast signature</button></div>
         <h3 style="margin-top:12px">Market rumor (7B trade disturbance · 600cr)</h3>${cOpts ? `<div class="row"><select id="rumorC">${cOpts}</select><button class="btn" data-act="rumor" data-up="1">Spike ▲</button><button class="btn" data-act="rumor" data-up="0">Crash ▼</button></div>` : '<div class="sub">Dock at a market to spread rumors.</div>'}
         <h3 style="margin-top:12px">Outbound queue</h3><div id="outboxList" class="sub">Loading...</div></div></div>
-      <div class="stack">${presencePanel()}<div class="bevel panel"><h2>Sector Bulletins</h2><div style="max-height:340px;overflow:auto">${bulls}</div></div>
+      <div class="stack">${presencePanel()}${commsPanel()}<div class="bevel panel"><h2>Sector Bulletins</h2><div style="max-height:340px;overflow:auto">${bulls}</div></div>
         <div class="bevel panel"><h2>Ghost Fleet Registry</h2><div style="max-height:380px;overflow:auto">${ghosts}</div></div>
         <div class="bevel panel"><h2>Bounty Board</h2>${bounties}</div></div></div>`;
   }
@@ -3690,6 +3781,8 @@ const ArtAndUIController = (() => {
       } catch (e) { toast('Could not change fullscreen mode.', 'gold'); }
     },
     toggleMusic() { AudioEngine.toggleMusic(); render(); },
+    hailAsk(d) { hailPicker(+d.to >>> 0); },
+    sendHail(d) { if (GameEngine.sendHail(+d.to >>> 0, +d.m)) closeModal(); },
     toggleSfx() { AudioEngine.toggleSfx(); render(); },
     tab(d) { switchTab(d.tab); },
     gotoPlanet(d) { GameEngine.travelPlanet(+d.p); },

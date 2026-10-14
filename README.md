@@ -64,6 +64,8 @@ To play with real people nearby, you need a **MeshCore companion radio** (a smal
 
 The game automatically sets up a public channel on your radio called **#meshwars**. Other players on that channel show up in **Captains on the Mesh**.
 
+To talk to them, tap **✉ Hail** next to a captain (or **Hail all**) and pick a canned message such as *"Want to trade? Meet me at …"* or *"Mayday!"*. Replies show up in **Comms // Hails** with one-tap quick replies. Hails are tiny packets so they don't clog the mesh; a hail written while you're off-grid is sent when your radio connects, or dropped after 30 minutes.
+
 > ℹ️ Radio connections do not work in Safari or on iPhone.
 
 ---
