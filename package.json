@@ -1,0 +1,16 @@
+{
+  "name": "mesh-wars",
+  "private": true,
+  "description": "MESH WARS: Frontier Traders. The game itself needs no build; this tooling only regenerates character.js from src/character.",
+  "license": "MIT",
+  "scripts": {
+    "test:heartbeat": "node --test tools/heartbeat.test.cjs",
+    "typecheck": "tsc --noEmit",
+    "build": "esbuild src/character/index.ts --bundle --format=iife --global-name=CharacterKit --target=es2020 --outfile=character.js --banner:js=\"/* MESH WARS CharacterKit - GENERATED from src/character by 'npm run build'. Do not edit by hand. */\"",
+    "check": "npm run typecheck && npm run build"
+  },
+  "devDependencies": {
+    "esbuild": "^0.28.2",
+    "typescript": "^7.0.2"
+  }
+}

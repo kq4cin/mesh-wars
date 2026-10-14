@@ -91,11 +91,11 @@ table.data tr:hover td{background:rgba(56,217,255,.05)}
 .crewgrid{grid-template-columns:repeat(auto-fill,minmax(min(100%,390px),1fr))}
 .crewcard{display:grid;grid-template-columns:120px minmax(0,1fr);gap:12px;padding:12px;align-items:start}
 .crewcard>div{min-width:0}
-.crewcard svg{width:120px;height:144px}
+.crewcard .portrait-art{width:120px;height:144px}
 .crewcard .spread{flex-wrap:wrap;gap:4px}
 .crewcard .statline{grid-template-columns:28px minmax(20px,1fr) 52px}
 .portrait-art{background:#08121e;box-shadow:0 6px 18px #0006}
-@media(max-width:460px){.crewcard{grid-template-columns:88px minmax(0,1fr)}.crewcard svg{width:88px;height:106px}.crewcard .skills{gap:2px 8px;font-size:10px}}
+@media(max-width:460px){.crewcard{grid-template-columns:88px minmax(0,1fr)}.crewcard .portrait-art{width:88px;height:106px}.crewcard .skills{gap:2px 8px;font-size:10px}}
 .skills{display:grid;grid-template-columns:1fr 1fr;gap:2px 12px;font-size:11px;margin-top:6px}
 .skills div{display:flex;justify-content:space-between}
 .skills b{font-family:var(--mono);color:#fff}
@@ -128,7 +128,7 @@ table.data tr:hover td{background:rgba(56,217,255,.05)}
 .unit .spread{flex-wrap:wrap;gap:4px}
 .board-parties{grid-template-columns:repeat(2,minmax(0,1fr))}
 @media(max-width:720px){.board-parties{grid-template-columns:1fr}}
-.unit svg{width:54px;height:54px}
+.unit .portrait-art{width:54px;height:54px}
 .unit.act{box-shadow:inset 0 0 0 2px var(--gold),0 0 12px rgba(255,181,71,.4)}
 .unit.down{opacity:.35;filter:grayscale(1);cursor:default}
 .unit.tgt:hover{box-shadow:inset 0 0 0 2px var(--red)}
@@ -152,7 +152,7 @@ label.f{display:flex;flex-direction:column;gap:3px;font-size:10px;letter-spacing
 @keyframes tutglow{50%{box-shadow:0 0 0 9999px rgba(0,3,8,.58),0 0 34px rgba(56,217,255,1)}}
 #tutCard{position:fixed;z-index:31;display:none;width:min(390px,calc(100vw - 24px));max-height:calc(100vh - 24px);max-height:calc(100dvh - 24px);overflow:auto;padding:14px 16px;--bev:12px;box-shadow:inset 0 0 0 1px var(--cy),0 10px 40px rgba(0,0,0,.6)}
 .thumb svg{width:100%;height:100%;display:block}
-.unit svg,.crewcard svg{display:block}
+.portrait-art{display:block}
 ::-webkit-scrollbar{width:8px;height:8px}::-webkit-scrollbar-thumb{background:#1d3a5a}::-webkit-scrollbar-track{background:transparent}
 .market td.acts,.market .bp{white-space:nowrap}
 .hailgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(100%,250px),1fr));column-gap:8px}
@@ -301,6 +301,7 @@ label.f{display:flex;flex-direction:column;gap:3px;font-size:10px;letter-spacing
 </div>
 <div id="modal"><div class="bevel" id="modalBox"></div></div>
 <div id="toasts"></div>
+<script src="character.js"></script>
 <script>
 'use strict';
 // ============================================================================
@@ -778,6 +779,7 @@ const MeshProtocol = (() => {
     'Requesting escort out of {sys}.', 'Mayday! Under fire near {sys}!', 'Prices are hot at {sys} right now.', 'On my way.',
     'Thanks, Captain!', 'Good fight. o7', 'Stand down - I mean no harm.', 'You are on my scope. Prepare to be boarded.',
     'Copy that.', 'Negative.', 'Signing off - see you in the black.',
+    'Taking a break - stepping away for a while. Fly safe!',
   ];
   const PREFIX = 'MW';
   const SIG_VERSION = 1;
@@ -1176,11 +1178,13 @@ const MeshProtocol = (() => {
       this.log('Sign-off broadcast');
     },
     async queue(bytes, label, kind = 'misc') {
+      if (kind === 'heartbeat' && this.hooks.heartbeatIdle()) return;
       const wire = encodeWire(bytes);
-      if (kind === 'sig') {
+      if (kind === 'sig' || kind === 'heartbeat') {
         // only the newest signature matters for presence; drop stale queued ones to save airtime
-        for (const it of await StorageManager.all('outbox')) if (it.kind === 'sig') await StorageManager.del('outbox', it.qid);
+        for (const it of await StorageManager.all('outbox')) if (it.kind === 'sig' || it.kind === 'heartbeat') await StorageManager.del('outbox', it.qid);
       }
+      if (kind === 'heartbeat' && this.hooks.heartbeatIdle()) return;
       await StorageManager.put('outbox', { wire, hex: U.hexBytes(bytes), label, kind, t: Date.now() });
       if (this.bc) this.bc.postMessage({ wire, ts: U.now() });
       this.log(`Queued ${label} (${bytes.length}B) ${wire}`);
@@ -1204,7 +1208,18 @@ const MeshProtocol = (() => {
         }
         while (items.length && this.client) {
           const batch = []; let len = 0;
-          while (items.length && (!batch.length || len + items[0].wire.length + 1 <= MAX_TEXT)) { const it = items.shift(); batch.push(it); len += it.wire.length + 1; }
+          while (items.length && (!batch.length || len + items[0].wire.length + 1 <= MAX_TEXT)) {
+            const it = items.shift();
+            // Recognize automatic signatures queued by older versions as well.
+            const automatic = it.kind === 'heartbeat' || (it.kind === 'sig' && it.label === 'Auto ship signature');
+            if (automatic && this.hooks.heartbeatIdle()) {
+              await StorageManager.del('outbox', it.qid);
+              this.log('Dropped idle heartbeat');
+              continue;
+            }
+            batch.push(it); len += it.wire.length + 1;
+          }
+          if (!batch.length) continue;
           const text = batch.map(b => b.wire).join(' ');
           const t = enc.encode(text), f = new Uint8Array(7 + t.length);
           f[0] = 3; f[1] = 0; f[2] = ch & 255; U.le32(f, 3, U.now()); f.set(t, 7); // CMD_SEND_CHANNEL_TXT_MSG
@@ -1916,13 +1931,33 @@ const GameEngine = {
     return { player: s.playerHash, hull: s.ship.hullType, rating: this.rating(), aggro: s.aggro, crew: s.crew.length, weapons: this.weaponHash(s.ship.modules.w), departing };
   },
   broadcastSignature(auto = false) {
+    if (auto && this.heartbeatIdle()) return;
     this.state.lastSigAt = U.now();
-    MeshProtocol.manager.queue(MeshProtocol.packSignature(this.signature()), auto ? 'Auto ship signature' : 'Ship signature', 'sig');
+    MeshProtocol.manager.queue(MeshProtocol.packSignature(this.signature()), auto ? 'Auto ship signature' : 'Ship signature', auto ? 'heartbeat' : 'sig');
     if (!auto) { ArtAndUIController.toast('Ship signature queued for broadcast', 'cy'); AudioEngine.play('radio'); }
     this.save();
   },
   // ---------- Presence (who is on the mesh) ----------
   PRESENCE_ONLINE: 35 * 60, PRESENCE_RECENT: 2 * 3600,
+  HEARTBEAT_IDLE_MS: 5 * 60 * 1000,
+  lastActivityAt: Date.now(),
+  heartbeatIdle() { return Date.now() - this.lastActivityAt >= this.HEARTBEAT_IDLE_MS; },
+  notePlayerActivity() {
+    const wasIdle = this.heartbeatIdle();
+    this.lastActivityAt = Date.now();
+    if (wasIdle) {
+      this.heartbeatTick();
+      ArtAndUIController.render();
+    }
+  },
+  initActivityTracking() {
+    const activity = e => { if (e.isTrusted && !document.hidden) this.notePlayerActivity(); };
+    for (const event of ['pointerdown', 'pointermove', 'keydown', 'wheel', 'input', 'click']) {
+      document.addEventListener(event, activity, { capture: true, passive: true });
+    }
+    window.addEventListener('focus', activity);
+    document.addEventListener('visibilitychange', activity);
+  },
   isSim(g) { return g.source === 'sim'; },
   presence(g, now = U.now()) {
     const age = Math.max(0, now - (g.lastHeard || g.seen));
@@ -1951,7 +1986,7 @@ const GameEngine = {
   },
   heartbeatTick() {
     const s = this.state, M = MeshProtocol.manager, min = s.settings.heartbeat | 0;
-    if (!min || !M.online() || !M.client.ready) return;
+    if (!min || this.heartbeatIdle() || !M.online() || !M.client.ready) return;
     if (U.now() - s.lastSigAt >= min * 60) this.broadcastSignature(true);
   },
   signOff() { return MeshProtocol.manager.signOff(MeshProtocol.packSignature(this.signature(true))); },
@@ -3033,206 +3068,18 @@ const ArtAndUIController = (() => {
         <text x="100" y="-93" text-anchor="middle" fill="#83c3d6" font-size="4" letter-spacing="2" font-family="Consolas,monospace">DORSAL / ${U.esc(H.name.toUpperCase())}</text>` : ''}${body}</svg>`;
   }
 
-  // ---------------- SVG: graphic-novel crew portraits ----------------
-  function characterTraits(seed) {
-    const r = U.rng(seed >>> 0, 'character-identity'), roll = r();
-    const species = roll < .55 ? 'human' : roll < .70 ? 'veyran' : roll < .85 ? 'kael' : 'robot';
-    const female = r() < .28 && species !== 'robot';
-    const name = { human: 'Human', veyran: 'Veyran', kael: 'Kael', robot: 'Robot' }[species];
-    return { species, female, chassis: r() < .5 ? 'sentinel' : 'cyclops', label: species === 'robot' ? name : `${name} / ${female ? 'Female' : 'Male'}` };
+  // ---------------- Crew portraits (layered CharacterKit renderer, see src/character) ----------------
+  const Kit = window.CharacterKit || null;
+  if (Kit) Kit.configure({ jobColors: Object.fromEntries(Object.entries(JOBS).map(([k, v]) => [k, v.color])) });
+  function characterTraits(seed) { return Kit ? Kit.traits(seed) : { label: 'Crew' }; }
+  // Expression follows the character's condition; recruits look keen.
+  function crewExpression(hp, max, opts = {}) {
+    if (hp <= 0) return 'ko';
+    if (hp < max * 0.35) return 'hurt';
+    return opts.active ? 'determined' : opts.happy ? 'happy' : 'neutral';
   }
-
-  function avatarSVG(seed, job) {
-    const r = U.rng(seed >>> 0, 'face'), id = U.uid(), jc = (JOBS[job] || JOBS.Captain).color;
-    const traits = characterTraits(seed), { species, female } = traits, robot = species === 'robot', alien = species === 'veyran' || species === 'kael';
-    const skin = U.pick(r, {
-      human: ['#f1cfb2', '#e2b48f', '#c88f68', '#9c6747', '#6c4430'],
-      veyran: ['#72b4b6', '#6385b4', '#8c9fc8', '#417d87'],
-      kael: ['#b99a72', '#ba839f', '#8c79ad', '#948aab'],
-      robot: ['#b3c2c7', '#87999f', '#b2a18a', '#738c9f'],
-    }[species]);
-    const hair = U.pick(r, ['#16161c', '#4a3020', '#c9a04a', '#d8d8e0', '#7a2330', '#2a6f9e', '#d05ac0', '#e8763a']);
-    const eye = U.pick(r, ['#38d9ff', '#4dffa6', '#ffb547', '#6b4a2a', '#3a5a8a', '#c04050']);
-    const hw = (female ? 32 : 36) + r() * 5, top = 29 - r() * 5, chin = (female ? 141 : 146) + r() * 5, jawY = 119 + r() * 7, chinW = (female ? 10 : 18) + r() * 5;
-    const style = (female ? [1, 4, 5, 0, 4, 5] : [0, 2, 3, 5, 0, 3])[Math.floor(r() * 6)];
-    const cyber = r() < .28, scar = r() < .32, beard = r() < .35 && !female && !alien, visor = job === 'Marine' && r() < .5;
-    const L = 100 - hw, R = 100 + hw, f = v => v.toFixed(1);
-    const head = `M${f(L)},80 Q${f(L - 2)},${f(top)} 97,${f(top)} Q${f(R + 4)},${f(top - 2)} ${f(R)},79
-      L${f(R - 3)},111 L${f(R - 9)},${f(jawY)} L${f(101 + chinW)},${f(chin - 6)}
-      Q101,${f(chin + 2)} ${f(101 - chinW)},${f(chin - 5)} L${f(L + 6)},${f(jawY - 1)} L${f(L)},104Z`;
-    const cap = `M${L - 2},96 L${L - 6},61 Q${L - 7},${top - 13} 99,${top - 10}
-      Q${R + 11},${top - 12} ${R + 3},68 L${R - 2},92 L${R - 7},66
-      Q103,53 78,63 L${L + 5},77 L${L + 3},98Z`;
-    const hairPath = alien ? '' : [
-      cap,
-      `M${L - 7},156 Q${L - 20},107 ${L - 9},53 Q${L - 5},${top - 18} 103,${top - 10}
-        Q${R + 19},${top - 8} ${R + 10},84 L${R + 16},153 L${R - 3},160 L${R - 4},68
-        Q110,55 98,48 Q86,64 ${L + 4},78 L${L + 6},153Z`,
-      `M${L - 1},78 Q${L - 9},41 85,${top - 4} L93,${top - 19} L114,${top - 14}
-        L119,${top - 3} L115,65 L102,60 L100,${top + 4} Q77,44 ${L + 3},85Z`,
-      '',
-      cap + ` M107,${top - 9} C91,${top - 35} 142,${top - 32} 132,${top - 3}Z`,
-      `M${L - 3},101 Q${L - 14},74 ${L - 2},41 Q87,${top - 18} ${R + 3},${top - 5}
-        L${R + 9},58 L${R - 4},81 L${R - 5},58 Q104,78 ${L + 9},89 L${L + 4},104Z`,
-    ][style];
-    const sm = (r() - .5) * 3, brow = 79 - r() * 3, mature = r() < (female ? .22 : .6);
-    const eyes = [82, 116].map((ex, i) => (cyber && i === 1)
-      ? `<path d="M108,82 L124,78 L${R - 1},85 L${R - 3},108 L123,116 L117,101 L107,98Z" fill="url(#uf${id})" stroke="#112534" stroke-width="1.3"/>
-         <path d="M127,85 V103 L131,107" fill="none" stroke="${jc}" stroke-width=".8"/>
-         <circle cx="117" cy="91" r="6" fill="#050d16" stroke="#99afbe" stroke-width="1.5"/>
-         <circle cx="117" cy="91" r="3.5" fill="${jc}"/><circle cx="116" cy="90" r="1.4" fill="#fff"/>
-         <path d="M110,102 L117,105 L121,117" fill="none" stroke="#8395a1" stroke-width="1"/>`
-      : `<path d="M${ex - 9},90 Q${ex - 1},83 ${ex + 9},90 L${ex + 5},94 L${ex - 5},94Z" fill="#352e31" opacity=".45"/>
-         <path d="M${ex - 8},90 Q${ex},85 ${ex + 8},90 Q${ex + 1},94 ${ex - 6},92Z" fill="#cfcec1"/>
-         <circle cx="${ex + 1}" cy="90" r="2.8" fill="${alien ? '#ffdc83' : eye}"/>
-         ${alien ? `<path d="M${ex + 1},87 L${ex + 2},90 L${ex + 1},93 L${ex},90Z" fill="#16243a"/>` : `<circle cx="${ex + 1}" cy="90" r="1.5" fill="#0b1321"/>`}
-         <circle cx="${ex}" cy="89" r=".8" fill="#fff"/>
-         <path d="M${ex - 8},90 Q${ex},85 ${ex + 8},90" fill="none" stroke="#28232a" stroke-width="1.7"/>
-         <path d="M${ex - 6},95 Q${ex + 2},98 ${ex + 8},94" fill="none" stroke="#442e31" stroke-opacity=".5" stroke-width=".9"/>
-         ${female ? `<path d="M${ex - 9},87 L${ex - 7},90 Q${ex},84 ${ex + 8},89 L${ex + 10},87" fill="none" stroke="#342c40" stroke-width="1.3"/>` : ''}`).join('');
-    let strands = '';
-    for (let i = 0; i < 18; i++) {
-      const x = L - 7 + i * 5;
-      strands += `<path d="M${x},${top - 12} Q${x - 21},45 ${x - 3},83 T${x - 4},159" fill="none" stroke="${i % 3 ? '#070f19' : '#eee4c8'}" stroke-opacity="${i % 3 ? '.3' : '.24'}" stroke-width="${i % 3 ? 1.8 : .9}"/>`;
-    }
-    const badge = {
-      Captain: 'M-7,1 L0,-7 L7,1 L0,8Z M-10,3 L0,13 L10,3',
-      Pilot: 'M-12,-2 L-4,0 L0,-7 L4,0 L12,-2 L6,6 H-6Z',
-      Gunner: 'M-8,-8 L8,8 M8,-8 L-8,8 M-6,0 H6 M0,-6 V6',
-      Engineer: 'M-7,-8 L-2,-3 L2,-7 L7,-8 L6,-2 L2,1 L-5,9 L-9,5 L-2,-2Z',
-      Medic: 'M-3,-9 H3 V-3 H9 V3 H3 V9 H-3 V3 H-9 V-3 H-3Z',
-      Marine: 'M-8,-8 H8 V3 L0,10 L-8,3Z M-4,-3 H4 M-4,1 H4',
-      Tactician: 'M0,-10 L9,0 L0,10 L-9,0Z M0,-4 L4,0 L0,4 L-4,0Z',
-      Scout: 'M-9,7 L0,-9 L9,7 L0,3Z',
-    }[job] || 'M-7,0 H7 M0,-7 V7';
-    const headset = job === 'Pilot' || job === 'Scout' || job === 'Tactician';
-    const alienCrown = species === 'veyran' ? `<g data-feature="cranial-fins" fill="url(#skin${id})" stroke="#213a50" stroke-width="1.5">
-      <path d="M${L + 6},80 Q35,39 43,18 Q70,32 90,38 L100,12 L110,38 Q144,21 158,18 Q159,49 ${R - 3},84 L124,56 L100,48 L78,57Z"/>
-      <path d="M${L + 4},91 L39,64 L45,112 L${L + 5},122 M${R - 3},91 L162,64 L155,112 L${R - 5},122"/>
-      <path d="M49,30 L76,61 M100,23 V47 M150,29 L128,61 M44,79 L59,108 M156,80 L142,109" fill="none" stroke="#b6e3dc" stroke-opacity=".55"/>
-      </g>` : species === 'kael' ? `<g data-feature="horns" fill="url(#horn${id})" stroke="#29263c" stroke-width="1.7">
-      <path d="M${L + 11},53 Q${L - 20},39 ${L - 11},9 Q${L - 1},32 ${L + 23},36Z"/>
-      <path d="M${R - 11},53 Q${R + 20},39 ${R + 11},9 Q${R + 1},32 ${R - 23},36Z"/>
-      <path d="M${L - 9},26 L${L + 2},36 M${R + 9},26 L${R - 2},36" stroke="#dcd2b6" stroke-opacity=".5"/>
-      <path d="M${L},85 L${L - 23},71 L${L - 11},106 L${L + 3},114 M${R},85 L${R + 23},71 L${R + 11},106 L${R - 3},114" fill="url(#skin${id})"/>
-      </g>` : '';
-    const robotHead = `<g data-feature="robot-head" stroke-linejoin="round">
-      <path d="M77,135 L78,162 L96,181 H107 L125,162 L123,135Z" fill="#101d2d" stroke="#b3cbd0" stroke-width="1.5"/>
-      <path d="M87,140 V168 M113,140 V168" stroke="#9caeb6" stroke-width="5"/>
-      <path d="M93,143 H107 M93,149 H107 M93,155 H107 M93,161 H107" stroke="${jc}" stroke-width="2"/>
-      <path d="M65,72 L51,61 L52,35" fill="none" stroke="#728fa3" stroke-width="3"/><circle cx="52" cy="33" r="3" fill="${jc}"/>
-      <path d="M64,74 H53 V108 L66,118 M136,74 H147 V108 L135,118" fill="url(#uf${id})" stroke="#b4c6cb" stroke-width="1.5"/>
-      <path d="M65,50 L78,31 H119 L138,50 L140,114 L123,140 L105,149 H90 L67,134 L59,110Z" fill="url(#metal${id})" stroke="#0c1725" stroke-width="2.5"/>
-      <path d="M66,50 L82,36 H117 L132,50 L124,67 H77Z" fill="${skin}" stroke="#d4e1df" stroke-width="1"/>
-      <path d="M93,37 V58 H107 V37 M68,53 L78,64 M130,53 L120,64" fill="none" stroke="#405967" stroke-width="2"/>
-      <path d="M67,72 L80,66 H124 L134,76 L130,103 L114,112 H81 L66,99Z" fill="#07131e" stroke="#6c929f" stroke-width="1.5"/>
-      ${traits.chassis === 'sentinel' ? `<g data-feature="dual-optics">
-        <path d="M71,82 L90,78 L94,90 L77,95Z M107,81 L127,79 L125,94 L107,93Z" fill="#244150" stroke="#aacbd0"/>
-        <path d="M77,85 H87 M112,86 H123" stroke="${jc}" stroke-width="5"/>
-        <path d="M78,84 H86 M113,85 H122" stroke="#edffff" stroke-width="1.2"/>
-        <path d="M97,85 L93,110 H105 L102,85Z" fill="url(#metal${id})" stroke="#8aa3b1"/>
-        </g>` : `<g data-feature="single-optic">
-        <path d="M70,88 H130" stroke="${jc}" stroke-width="2"/>
-        <circle cx="100" cy="87" r="17" fill="#101e2c" stroke="#c2d5dc" stroke-width="2"/>
-        <circle cx="100" cy="87" r="11" fill="${jc}"/><circle cx="100" cy="87" r="6" fill="#123240"/>
-        <circle cx="97" cy="84" r="3.5" fill="#efffff"/>
-        </g>`}
-      <path d="M67,108 L84,116 L91,138 L74,127Z M133,106 L117,116 L111,138 L127,126Z" fill="${skin}" stroke="#becdca" stroke-width="1"/>
-      <path d="M88,119 H112 L108,134 H93Z" fill="#07131c" stroke="#91adb6"/>
-      <path d="M94,122 V130 M99,122 V131 M104,122 V130" stroke="#728b98" stroke-width="2"/>
-      <path d="M76,111 L81,112 M121,111 L126,108 M94,141 H107" stroke="${jc}" stroke-width="2"/>
-      <g fill="#0d1e2d" stroke="#d4dace" stroke-width=".7"><circle cx="71" cy="57" r="2"/><circle cx="128" cy="57" r="2"/><circle cx="75" cy="126" r="2"/><circle cx="125" cy="123" r="2"/></g>
-      <path d="M72,47 L79,44 M117,40 L126,47 M69,121 L73,124" stroke="#eef1dd" stroke-opacity=".55"/>
-      </g>`;
-    return `<svg class="portrait-art" data-species="${species}" data-gender="${robot ? 'none' : female ? 'female' : 'male'}" viewBox="0 0 200 240" role="img" aria-label="${U.esc(traits.label)} ${U.esc(job)} crew portrait" xmlns="http://www.w3.org/2000/svg"><defs>
-      <radialGradient id="bg${id}" cx="28%" cy="35%" r="80%"><stop stop-color="${jc}" stop-opacity=".32"/><stop offset=".65" stop-color="#122437"/><stop offset="1" stop-color="#050c17"/></radialGradient>
-      <linearGradient id="skin${id}" x1="0%" y1="20%" x2="100%" y2="70%"><stop stop-color="${alien ? '#cedbe8' : '#f6d8b5'}"/><stop offset=".18" stop-color="${skin}"/><stop offset=".55" stop-color="${skin}"/><stop offset="1" stop-color="#423845"/></linearGradient>
-      <linearGradient id="horn${id}"><stop stop-color="#ddcaa2"/><stop offset=".45" stop-color="#8c7183"/><stop offset="1" stop-color="#29283b"/></linearGradient>
-      <linearGradient id="metal${id}" x1="0%" y1="10%" x2="100%" y2="90%"><stop stop-color="#d5e0df"/><stop offset=".28" stop-color="${skin}"/><stop offset=".32" stop-color="#556d7d"/><stop offset=".7" stop-color="#25394a"/><stop offset="1" stop-color="#8baab3"/></linearGradient>
-      <linearGradient id="rim${id}"><stop stop-color="#91e3ed" stop-opacity="0"/><stop offset=".8" stop-color="#91e3ed" stop-opacity="0"/><stop offset="1" stop-color="#91e3ed" stop-opacity=".55"/></linearGradient>
-      <linearGradient id="hair${id}" x1="0%" y1="0%" x2="80%" y2="100%"><stop stop-color="${hair}"/><stop offset=".45" stop-color="${hair}"/><stop offset="1" stop-color="#080f1a"/></linearGradient>
-      <clipPath id="hc${id}"><path d="${head}"/></clipPath>
-      <clipPath id="hairclip${id}"><path d="${hairPath}"/></clipPath>
-      <linearGradient id="uf${id}" x1="0%" y1="0%" x2="80%" y2="100%"><stop stop-color="#607684"/><stop offset=".22" stop-color="#2e4255"/><stop offset=".6" stop-color="#182735"/><stop offset="1" stop-color="#080f1a"/></linearGradient>
-      <linearGradient id="fade${id}" x1="0%" y1="0%" x2="0%" y2="100%"><stop offset=".78" stop-color="#050c17" stop-opacity="0"/><stop offset="1" stop-color="#050c17" stop-opacity=".95"/></linearGradient></defs>
-      <rect width="200" height="240" fill="url(#bg${id})"/>
-      <path d="M-10,172 L158,4 H186 L-10,200Z" fill="${jc}" opacity=".06"/>
-      <circle cx="100" cy="90" r="77" fill="none" stroke="${jc}" stroke-opacity=".16" stroke-width=".8"/>
-      <path d="M10,52 H40 M160,52 H190 M20,42 V160 M180,42 V160 M16,151 H34 M166,151 H184" stroke="${jc}" stroke-opacity=".2" fill="none"/>
-      <path d="M-8,241 L1,196 Q5,181 53,166 L76,157 H126 L152,168 Q192,178 199,200 L210,241Z" fill="url(#uf${id})" stroke="#080e17" stroke-width="3"/>
-      <path d="M1,197 L44,180 L53,203 L44,240 H-6Z M158,180 L194,194 L205,237 H160 L150,204Z" fill="url(#uf${id})" stroke="#81939f" stroke-opacity=".6" stroke-width="1"/>
-      <path d="M7,195 L43,181 M158,181 L193,195" fill="none" stroke="${jc}" stroke-width="3"/>
-      <path d="M51,181 L61,202 L56,240 M145,183 L137,205 L146,240" fill="none" stroke="#0a1522" stroke-width="4"/>
-      <path d="M56,185 L65,202 L61,235 M142,186 L134,204" fill="none" stroke="#a6b6b9" stroke-opacity=".35" stroke-width="1"/>
-      ${robot ? '' : `<path d="M80,133 L77,166 L99,190 L125,167 L120,130Z" fill="url(#skin${id})" stroke="#15202b" stroke-width="1.8"/>
-      <path d="M80,137 Q98,157 122,138 L120,154 L96,174 L81,161Z" fill="#251f2b" opacity=".45"/>
-      <path d="M82,157 L92,172 M116,154 L106,177" stroke="${skin}" stroke-width="2" opacity=".5"/>`}
-      <path d="M73,154 L96,183 L90,204 L64,177Z M126,154 L102,183 L111,203 L139,176Z" fill="url(#uf${id})" stroke="#92a6ac" stroke-width="1.1"/>
-      <path d="M71,159 L94,185 M130,159 L105,185" stroke="${jc}" stroke-width="2"/>
-      <path d="M98,193 V238 M103,193 V238" stroke="#8ba0a9" stroke-width=".7" opacity=".5"/>
-      ${robot ? robotHead : `<g data-feature="organic-face">${alienCrown}
-      <path d="M${L + 2},85 Q${L - 12},78 ${L - 7},103 L${L + 3},114 M${R - 2},86 Q${R + 10},80 ${R + 5},104 L${R - 3},114" fill="url(#skin${id})" stroke="#302c33" stroke-width="1.8"/>
-      <path d="M${L - 4},90 L${L - 1},103 M${R + 2},91 L${R - 1},103" stroke="#583e3f" stroke-width="2" fill="none"/>
-      <path d="${head}" fill="url(#skin${id})" stroke="#262630" stroke-width="1.8"/>
-      <g clip-path="url(#hc${id})">
-        <path d="M102,26 L146,25 L145,122 L118,150 L97,150 L108,135 L113,118 L104,109 L111,86 L102,67Z" fill="#292332" opacity=".24"/>
-        <path d="M${L},87 L79,101 L91,103 L80,117 L${L + 6},110Z M124,101 L${R},92 L${R - 5},118 L114,121Z" fill="#5c3438" opacity=".3"/>
-        <path d="M${L + 3},99 L78,101 L87,106 L76,107Z M78,67 L88,48 L98,46 L93,71Z" fill="#ffe8c4" opacity=".26"/>
-        <path d="M76,118 L85,123 M119,120 L115,131 M91,140 L107,142" fill="none" stroke="#442c34" stroke-opacity=".35" stroke-width="1.5"/>
-        ${mature ? '<path d="M79,71 Q89,68 97,70 M81,75 L95,73 M72,95 L68,98 M125,95 L131,99 M80,104 L88,106" fill="none" stroke="#533842" stroke-opacity=".4" stroke-width=".8"/>' : ''}
-        <path d="${head}" fill="url(#rim${id})"/>
-      </g>
-      ${beard ? `<path d="M${L + 4},108 L83,124 L97,119 L110,121 L${R - 5},108 L${R - 10},${jawY}
-        L${101 + chinW},${chin - 5} Q101,${chin + 1} ${101 - chinW},${chin - 5} L${L + 7},${jawY}Z" fill="url(#hair${id})" opacity=".83"/>
-        <path d="M83,134 L87,139 M88,137 L93,143 M96,139 L99,145 M106,137 L106,143 M114,133 L112,140" stroke="${skin}" stroke-opacity=".3" stroke-width=".7"/>` : ''}
-      ${eyes}
-      ${female ? `<path d="M72,${brow + 5} Q79,${brow - 2} 92,${brow + 4} M108,${brow + 4} Q121,${brow - 2} 128,${brow + 4}" fill="none" stroke="${alien ? '#344452' : hair}" stroke-width="1.9"/>`
-      : `<path d="M72,${brow + 4} L79,${brow} L92,${brow + 2} L92,${brow + 6} L80,${brow + 4}Z
-        M108,${brow + 2} L121,${brow} L128,${brow + 3} L120,${brow + 4} L109,${brow + 6}Z" fill="${alien ? '#344452' : hair}" stroke="#25212a" stroke-width=".5"/>`}
-      <g transform="translate(100 0) scale(${female ? '.82' : '1'} 1) translate(-100 0)">
-      <path d="M99,87 L94,109 L99,113 L109,110 L103,91" fill="${skin}" opacity=".85"/>
-      <path d="M103,94 L106,105 L110,110 L103,114 L96,113 L93,110" fill="none" stroke="#50393c" stroke-width="1.2" stroke-linejoin="round"/>
-      <path d="M98,96 L96,106 L99,108" fill="none" stroke="#ffecd1" stroke-opacity=".5" stroke-width="1.6"/>
-      <path d="M94,111 L97,111 M104,111 L107,110" stroke="#312a32" stroke-width="1.5"/>
-      <path d="M98,115 L97,120 M103,115 L105,120" stroke="#744949" stroke-opacity=".6" stroke-width=".9"/></g>
-      <path d="${female ? 'M88,127 L96,122 L101,124 L106,122 L113,127 L105,134 L95,133Z' : 'M88,127 L97,123 L101,125 L105,123 L113,127 L103,133 L95,132Z'}" fill="${beard ? skin : female ? '#9e5367' : '#975d5d'}" opacity="${female ? '.9' : '.7'}"/>
-      <path d="M88,127 Q101,${128 + sm} 113,127" fill="none" stroke="#432d36" stroke-width="1.5"/>
-      <path d="M95,131 L104,132" fill="none" stroke="#ffe1c5" stroke-opacity=".45" stroke-width="1.1"/>
-      ${scar ? '<path d="M76,77 L80,98 L85,112" fill="none" stroke="#66333c" stroke-width="1.8"/><path d="M77,77 L81,98 L86,111" fill="none" stroke="#f4c6b3" stroke-opacity=".65" stroke-width=".8"/>' : ''}
-      ${species === 'veyran' ? `<g data-feature="bioluminescence" fill="#b7f7dc">
-        <path d="M94,36 L100,21 L107,36 L102,64 H98Z" fill="url(#skin${id})" stroke="#34546a"/>
-        <circle cx="85" cy="65" r="2"/><circle cx="93" cy="61" r="1.5"/><circle cx="107" cy="61" r="1.5"/><circle cx="115" cy="65" r="2"/>
-        <circle cx="74" cy="106" r="1.6"/><circle cx="78" cy="111" r="1.1"/><circle cx="125" cy="106" r="1.6"/><circle cx="121" cy="111" r="1.1"/>
-        </g>` : species === 'kael' ? `<g data-feature="cranial-ridges" fill="url(#horn${id})" stroke="#424054" stroke-width=".8">
-        <path d="M93,34 L100,19 L108,34 L103,70 H98Z"/><path d="M76,49 L86,39 L93,46 L87,69Z M108,46 L116,39 L126,49 L113,69Z"/>
-        <path d="M70,106 L80,112 L84,120 L74,116Z M129,106 L119,112 L115,120 L125,116Z"/>
-        </g>` : ''}
-      ${hairPath ? `<path data-feature="hair" d="${hairPath}" fill="url(#hair${id})" stroke="#101622" stroke-width="2"/>
-        <g clip-path="url(#hairclip${id})">${strands}</g>` : `<path d="M${L + 9},62 Q${L + 11},38 93,36" fill="none" stroke="#ffe6c8" stroke-opacity=".3" stroke-width="3"/>`}
-      ${headset ? `<path d="M${L - 6},86 Q${L - 13},29 96,25" fill="none" stroke="#111b2a" stroke-width="5"/>
-        <rect x="${L - 11}" y="84" width="10" height="24" rx="4" fill="#263a4d" stroke="#93aeba" stroke-width="1"/>
-        <path d="M${L - 7},89 V99" stroke="${jc}" stroke-width="2"/>
-        <path d="M${L - 5},105 Q${L - 3},126 88,132" fill="none" stroke="#07121e" stroke-width="3"/>
-        <rect x="86" y="130" width="8" height="4" rx="2" fill="#a3bac2"/>` : ''}
-      ${job === 'Engineer' ? `<path d="M${L - 2},62 Q100,53 ${R + 3},62" fill="none" stroke="#0a1522" stroke-width="8"/>
-        <rect x="72" y="55" width="23" height="15" rx="4" fill="#203746" stroke="#abb5a7" stroke-width="2"/>
-        <rect x="103" y="55" width="23" height="15" rx="4" fill="#203746" stroke="#abb5a7" stroke-width="2"/>
-        <path d="M77,59 H89 M108,59 H120" stroke="${jc}" stroke-width="2"/>` : ''}
-      ${visor ? `<path d="M${L - 5},80 L92,77 L${R + 5},81 L${R + 2},99 L110,103 L${L - 4},98Z" fill="#183746" fill-opacity=".65" stroke="#8cadb6" stroke-width="1.5"/>
-        <path d="M${L - 1},83 L93,80 L${R},84" stroke="${jc}" stroke-width="2"/>
-        <path d="M77,81 L86,99 M84,80 L93,100" stroke="#d3fbff" stroke-opacity=".35" stroke-width="2"/>` : ''}
-      </g>`}
-      ${job === 'Marine' ? '<path d="M54,170 L70,196 L92,204 L92,218 L60,210 L42,185Z M143,170 L130,194 L109,204 L109,217 L144,206 L157,185Z" fill="#354755" stroke="#9aadb3" stroke-width="1.3"/>' : ''}
-      ${job === 'Scout' ? `<path d="M65,168 Q103,192 136,166 L131,183 Q101,207 64,186Z" fill="#394f54" stroke="#162a36" stroke-width="1.5"/><path d="M69,178 Q105,197 129,177" fill="none" stroke="#94ada4" stroke-opacity=".5"/>` : ''}
-      ${job === 'Captain' ? `<path d="M14,188 L42,179 L47,186 L19,196Z M159,179 L185,188 L180,196 L154,186Z" fill="${jc}" stroke="#e9d3a3" stroke-width=".8"/>
-        <path d="M22,190 L25,196 M28,188 L31,194 M34,186 L37,192 M164,184 L161,190 M170,186 L167,192 M176,188 L173,194" stroke="#66543c" stroke-width="1.2"/>` : ''}
-      <g transform="translate(146 208) scale(.7)" fill="none" stroke="${jc}" stroke-width="2" stroke-linejoin="round"><path d="${badge}"/></g>
-      <path d="M64,212 H84 M64,216 H84 M64,220 H77" stroke="${jc}" stroke-width="1.8" opacity=".8"/>
-      <rect width="200" height="240" fill="url(#fade${id})"/>
-      <path d="M18,2 H2 V18 M182,2 H198 V18 M2,222 V238 H18 M182,238 H198 V222" fill="none" stroke="${jc}" stroke-opacity=".65" stroke-width="1.5"/>
-      <path d="M6,22 V218 M194,22 V218" stroke="#90c9d8" stroke-opacity=".15"/>
-      <text x="13" y="232" fill="#b8ced7" font-family="Consolas,monospace" font-size="7" letter-spacing="2">${U.esc(job.toUpperCase())}</text>
-      <text x="186" y="15" text-anchor="end" fill="${jc}" opacity=".6" font-family="Consolas,monospace" font-size="6" letter-spacing="1">${U.hex(seed >>> 0).slice(-4)}</text></svg>`;
+  function portrait(rec, opts = {}) {
+    return Kit ? Kit.portraitHTML({ seed: rec.seed, job: rec.job }, opts) : '<div class="portrait-art"></div>';
   }
 
   const logoSVG = `<svg width="30" height="30" viewBox="0 0 64 64"><path d="M32 6 L56 20 L56 44 L32 58 L8 44 L8 20Z" fill="none" stroke="#38d9ff" stroke-width="3"/><path d="M18 34 L32 18 L46 34 L38 32 L32 44 L26 32Z" fill="#ffb547"/></svg>`;
@@ -3418,7 +3265,7 @@ const ArtAndUIController = (() => {
   // ---------------- Crew ----------------
   function crewCard(c, hire) {
     const J = JOBS[c.job], T = TALENTS[J.talent], A = CREW_ACTS[J.crewAct], max = GameEngine.crewMaxHp(c);
-    return `<div class="bevel crewcard">${avatarSVG(c.seed, c.job)}<div>
+    return `<div class="bevel crewcard">${portrait(c, { crop: 'bust', expression: crewExpression(c.hp, max, { happy: hire }), track: hire ? undefined : 'crew-' + c.id, hp: hire ? undefined : c.hp })}<div>
       <div class="spread"><b>${esc(c.name)}</b><span class="tag" style="color:${J.color}">${c.job}</span></div>
       <div class="sub character-identity">${characterTraits(c.seed).label}</div>
       <div class="sub">Lv ${c.level} · <span class="gold">${T.name}</span>: ${T.desc}<br>Boarding: <span class="cy">${A.name}</span> - ${A.desc}</div>
@@ -3480,7 +3327,7 @@ const ArtAndUIController = (() => {
     const sel = b.sel ? CREW_ACTS[b.sel] : null;
     const card = u => {
       const tgt = mine && u.hp > 0 && ((!sel && u.side === 'e') || (sel && sel.target === 'enemy' && u.side === 'e') || (sel && sel.target === 'ally' && u.side === 'p'));
-      return `<div class="bevel unit ${u === cur ? 'act' : ''} ${u.hp <= 0 ? 'down' : ''} ${tgt ? 'tgt' : ''}"${tgt ? ` data-act="crewTarget" data-u="${u.id}"` : ''}>${avatarSVG(u.seed, u.job)}<div>
+      return `<div class="bevel unit ${u === cur ? 'act' : ''} ${u.hp <= 0 ? 'down' : ''} ${tgt ? 'tgt' : ''}"${tgt ? ` data-act="crewTarget" data-u="${u.id}"` : ''}>${portrait(u, { crop: 'head', expression: crewExpression(u.hp, u.maxHp, { active: u === cur }), track: 'board-' + u.id, hp: u.hp })}<div>
         <div class="spread"><b style="font-size:12px">${esc(u.name)}</b><span class="tag" style="color:${JOBS[u.job].color}">${u.job}</span></div>
         <div class="sub character-identity">${characterTraits(u.seed).label}</div>
         ${statline('HP', u.hp, u.maxHp, 'hp')}<div class="sub">${u.stunned ? '<span class="gold">STUNNED </span>' : ''}${u.exposed ? '<span class="red">EXPOSED </span>' : ''}${u.buff ? `<span class="cy">+${u.buff} dice</span>` : ''}</div></div></div>`;
@@ -3578,7 +3425,7 @@ const ArtAndUIController = (() => {
     const sims = GameEngine.presenceList(true).filter(x => GameEngine.isSim(x.g)).length;
     const hb = S.settings.heartbeat | 0;
     const you = M.online()
-      ? `You are on the mesh · ${hb ? `heartbeat every ${hb} min` : 'heartbeat off'}${S.lastSigAt ? ` · last sent ${U.ago(U.now() - S.lastSigAt)}` : ''}`
+      ? `You are on the mesh · ${hb ? GameEngine.heartbeatIdle() ? 'heartbeat paused (inactive)' : `heartbeat every ${hb} min` : 'heartbeat off'}${S.lastSigAt ? ` · last sent ${U.ago(U.now() - S.lastSigAt)}` : ''}`
       : 'You are off the mesh - connect a radio to appear to others';
     return `<div class="bevel panel"><h2>Captains on the Mesh</h2>
       <div class="row" style="gap:18px"><span><b class="grn" style="font-size:22px">${on.length}</b> <span class="dim">online</span></span><span><b class="gold" style="font-size:22px">${rec.length}</b> <span class="dim">recent</span></span><span class="sub">${dot(M.online() ? 'online' : 'offline')} ${you}</span><button class="btn sm gold" data-act="hailAsk" data-to="0" style="margin-left:auto">✉ Hail all</button></div>
@@ -3637,6 +3484,7 @@ const ArtAndUIController = (() => {
         <label class="f">Room password<input data-set="roomPassword" type="password" value="${esc(S.settings.roomPassword)}" style="width:120px"></label>
         <label class="f">Room name filter<input data-set="roomFilter" value="${esc(S.settings.roomFilter)}" style="width:120px"></label>
         <label class="f">Sim peers<input data-set="simPeers" type="checkbox" ${S.settings.simPeers ? 'checked' : ''}></label></div>
+        <div class="sub" style="margin-top:8px">Automatic heartbeats pause after 5 minutes without player input and resume when you return. Manual broadcasts and hails remain available.</div>
         <pre class="hex" style="max-height:140px;overflow:auto;background:rgba(2,6,12,.6);padding:6px;margin-top:10px;white-space:pre-wrap">${esc(M.logLines.join('\n')) || 'Radio idle.'}</pre></div>
       <div class="bevel panel"><h2>Broadcast</h2><div class="sub">Ship signature (16B): <span class="hex">${U.hexBytes(sig)}</span> → <span class="hex">${MeshProtocol.encodeWire(sig)}</span></div>
         <div class="row" style="margin-top:8px"><button class="btn gold" data-act="broadcastSig">Broadcast signature</button></div>
@@ -3663,7 +3511,7 @@ const ArtAndUIController = (() => {
         <div class="row" style="margin-top:8px"><input id="seedIn" value="${U.hex(S.seed)}" maxlength="10" style="width:120px"><button class="btn gold" data-act="reseedAsk">Re-seed galaxy</button></div></div>
       <div class="bevel panel"><h2>Audio</h2>${['master', 'sfx', 'music'].map(k => `<div class="statline"><span class="dim">${k.toUpperCase()}</span><input type="range" min="0" max="1" step="0.05" value="${AudioEngine.getVolume(k)}" data-vol="${k}"><span></span></div>`).join('')}</div>
       <div class="bevel panel"><h2>Offline / PWA</h2><div class="kv"><span>Storage</span><span>${StorageManager.usingIDB() ? 'IndexedDB (ship, crew, starmap, outbox, bulletins, meta)' : 'In-memory fallback'}</span><span>Service worker</span><span>${esc(StorageManager.swStatus())}</span></div>
-        <p class="sub">All artwork is generated locally. Crew identities are seeded: humans, fin-crested Veyran, horned Kael and mechanical robots. Organic crew are mostly male, with some female officers; robots have sentinel or cyclops chassis. These cosmetic identities do not change skills or combat rules. Existing names and career progress are preserved. Uniform colors, equipment and insignia reflect crew roles. No images, fonts or audio assets are downloaded.</p>
+        <p class="sub">All artwork is generated locally. Crew are built from a modular asset library: humans, cybernetic and reptilian aliens, and synthetic or combat robots, each with seeded heads, hair, uniforms, armor, accessories and job weapons. These cosmetic identities do not change skills or combat rules. Uniform colors, equipment and insignia reflect crew roles. No images, fonts or audio assets are downloaded.</p>
         <div class="row" style="margin-top:8px"><button class="btn gold" data-act="tutorial">Restart tutorial</button><button class="btn" data-act="exportSW">Export sw.js</button>${installPrompt ? '<button class="btn gold" data-act="installApp">Install app</button>' : ''}<button class="btn red" data-act="wipeAsk">Wipe all data</button></div></div></div></div>`;
   }
 
@@ -3689,6 +3537,7 @@ const ArtAndUIController = (() => {
     pendingView = false;
     const v = U.$('#view'), sc = v.scrollTop;
     v.innerHTML = VIEWS[tab]();
+    if (Kit) Kit.hydrate(v);
     v.scrollTop = sc;
     if (tab === 'bridge') { Planet.setPlanet(GameEngine.here(), GameEngine.herePlanet()); U.$('#planetSlot').prepend(Planet.cv); }
     if (tab === 'tactical') {
@@ -3943,7 +3792,7 @@ const ArtAndUIController = (() => {
     if (GameEngine.fresh) commissionModal();
   }
 
-  return { init, render, toast, switchTab, fx, combatOver, shipSVG, avatarSVG, characterTraits, Space, Planet };
+  return { init, render, toast, switchTab, fx, combatOver, shipSVG, portrait, characterTraits, Space, Planet };
 })();
 
 // ============================================================================
@@ -4098,10 +3947,12 @@ const Tutorial = (() => {
   await StorageManager.init();
   StorageManager.installManifest();
   await GameEngine.load();
+  GameEngine.initActivityTracking();
   MeshProtocol.manager.init({
     onPacket: (p, bytes, src, meta) => GameEngine.applyPacket(p, bytes, src, meta),
     onStatus: () => ArtAndUIController.render(),
     settings: () => GameEngine.state.settings,
+    heartbeatIdle: () => GameEngine.heartbeatIdle(),
     onConnected: () => GameEngine.broadcastSignature(true),
     onDisconnecting: () => GameEngine.signOff(),
   });

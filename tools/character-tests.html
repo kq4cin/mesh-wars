@@ -1,0 +1,116 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CharacterKit regression checks</title>
+<script src="../character.js"></script>
+<body>
+<h1>CharacterKit regression checks</h1>
+<pre id="results">Running...</pre>
+<div id="fixture"></div>
+<script>
+const K = CharacterKit, results = [];
+const assert = (condition, message) => { if (!condition) throw new Error(message); };
+const pixels = canvas => canvas.getContext('2d').getImageData(0, 0, canvas.width, canvas.height).data;
+function occupied(canvas) {
+  const data = pixels(canvas);
+  let count = 0;
+  for (let i = 3; i < data.length; i += 4) if (data[i] > 32) count++;
+  return count;
+}
+async function test(name, run) {
+  await run();
+  results.push(name);
+  document.getElementById('results').textContent = results.map(n => 'PASS ' + n).join('\n');
+}
+async function run() {
+  const f = new K.AssetFactory();
+  const canvas = document.createElement('canvas');
+  canvas.width = 120; canvas.height = 144;
+  const ctx = canvas.getContext('2d');
+  await test('All 32 sprites render in full, bust and head views', async () => {
+    assert(K.ARTWORK_IDS.length === 32, 'Expected 29 heads and 3 figures');
+    for (const spriteId of K.ARTWORK_IDS) {
+      const asset = f.create({ seed: 7, job: 'Pilot', customization: { spriteId } });
+      assert(asset.layers().every(l => l.source.kind === 'atlas'), spriteId + ' used generated art');
+      for (const crop of ['full', 'bust', 'head']) {
+        await asset.prefetch(120, 144, crop);
+        assert(asset.render(ctx, 0, 0, 120, 144, { crop, clear: true, time: 0 }), spriteId + '/' + crop + ' not ready');
+        const count = occupied(canvas);
+        assert(count > 600 && count < 120 * 144 * .95, spriteId + '/' + crop + ' is blank or opaque');
+      }
+    }
+  });
+  await test('Identity, equipment keys and explicit selection survive DOM hydration', () => {
+    const rec = { seed: 11, job: 'Marine', customization: { spriteId: 'head_hair_2' },
+      equipment: { armor: 'heavy', outfit: 'armorSuit', weapon: 'carbine', helmet: 'combat', accessories: ['belt', 'gloves'] } };
+    const asset = f.create(rec);
+    assert(f.create(rec) === asset, 'Character cache missed identical record');
+    assert(f.resolve({ seed: 11, job: 'Medic' }).artworkId === f.resolve({ seed: 11, job: 'Pilot' }).artworkId, 'Job changed identity');
+    const changed = f.create({ ...rec, equipment: { ...rec.equipment, accessories: ['backpack'] } });
+    assert(changed.key !== asset.key, 'Equipment missing from key');
+    assert(changed.layers()[0].sourceId === asset.layers()[0].sourceId, 'Equipment repainted fixed art');
+    const fixture = document.getElementById('fixture');
+    fixture.innerHTML = K.portraitMarkup(f, rec, { crop: 'head' });
+    const stage = new K.PortraitStage(f);
+    const before = f.stats().assets;
+    K.hydrateWith(stage, fixture);
+    assert(f.stats().assets === before, 'Hydration changed the resolved record');
+    assert(fixture.querySelector('canvas').getAttribute('aria-label').includes('Human / Male'), 'Wrong artwork label');
+    stage.unmount(fixture.querySelector('canvas'));
+    fixture.replaceChildren();
+    let rejected = false;
+    try { f.resolve({ seed: 1, job: 'Pilot', customization: { spriteId: 'missing' } }); } catch (e) { rejected = e instanceof RangeError; }
+    assert(rejected, 'Unknown sprite was silently accepted');
+  });
+  await test('One source decode is shared; regional textures respect eviction budget', async () => {
+    assert(f.stats().atlases === 1, 'Source decode was duplicated');
+    const cache = new K.TextureCache(256 * 1024), small = new K.AssetFactory({ cache });
+    for (const spriteId of K.ARTWORK_IDS) await small.create({ seed: 1, job: 'Pilot', customization: { spriteId } }).prefetch(120, 144, 'head');
+    assert(cache.stats().evictions > 0 && cache.stats().bytes <= 256 * 1024, 'LRU budget failed');
+    const source = f.create({ seed: 1, job: 'Pilot' }).layers()[0].source;
+    assert(K.sourceIdOf(source) !== K.sourceIdOf({ ...source, destination: { ...source.destination, x: 0 } }), 'Placement missing from texture key');
+  });
+  await test('KO retains transparency; reduced motion uses tint without shaking or new faces', async () => {
+    const asset = f.create({ seed: 3, job: 'Marine', customization: { spriteId: 'figure_1' } });
+    await asset.prefetch(120, 144, 'full');
+    const st = asset.createState();
+    asset.render(ctx, 0, 0, 120, 144, { crop: 'full', clear: true, time: 0, state: st });
+    const normal = occupied(canvas);
+    st.expression = 'ko';
+    asset.render(ctx, 0, 0, 120, 144, { crop: 'full', clear: true, time: 0, state: st });
+    assert(Math.abs(occupied(canvas) - normal) < 2, 'KO filled the transparent background');
+    st.reducedMotion = true;
+    asset.play('hit', 0, st);
+    const pose = asset.driver.sample(100, st);
+    assert(pose.bones.root.dx === 0 && pose.tint.alpha > 0 && !pose.face, 'Reduced-motion hit changed face/position');
+    assert(!asset.isAnimated(500, st), 'Fixed art kept animating after clip ended');
+  });
+  await test('Damage clip finishes on the original pixels', async () => {
+    const fixture = document.getElementById('fixture');
+    const cv = document.createElement('canvas');
+    cv.style.cssText = 'width:80px;height:80px';
+    fixture.append(cv);
+    const asset = f.create({ seed: 3, job: 'Marine', customization: { spriteId: 'head_bald_0' } });
+    const size = Math.round(80 * Math.min(2, devicePixelRatio || 1));
+    await asset.prefetch(size, size, 'head');
+    const stage = new K.PortraitStage(f), state = stage.mount(cv, asset, { crop: 'head' });
+    const before = pixels(cv).slice();
+    asset.play('hit', performance.now(), state);
+    stage.invalidate(cv);
+    await new Promise(resolve => setTimeout(resolve, 650));
+    assert(pixels(cv).every((v, i) => Math.abs(v - before[i]) <= 1), 'Last damage frame remained on canvas');
+    stage.unmount(cv); fixture.replaceChildren();
+  });
+  document.body.dataset.result = 'passed';
+  return { passed: results.length, checks: results, cache: f.stats() };
+}
+window.testResult = run().catch(error => {
+  document.body.dataset.result = 'failed';
+  document.getElementById('results').textContent += '\nFAIL ' + error.message;
+  console.error(error);
+  throw error;
+});
+</script>
+</body>
+</html>
