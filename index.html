@@ -1413,6 +1413,7 @@ const GameEngine = {
         for (let i = 0; i < n; i++) s += U.pick(r, SYL);
         s = U.cap(s);
         if (r() < 0.22) s += ' ' + U.pick(r, ['Prime', 'Reach', 'Gate', 'Major', 'Minor', 'Deep', 'Hollow', 'Verge']);
+        if (s === 'Pervo') s = 'Eve';
         if (!names.has(s)) { names.add(s); return s; }
       }
       return 'Sector ' + names.size;
